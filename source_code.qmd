@@ -1,0 +1,883 @@
+---
+title: "TCR ASSESSMENT for Computational Biologist (Single Cell Genomics) Role"
+format:
+    bookup-html:
+      code-fold: true
+      code-summary: "Show the code"
+      toc: true
+      fig-width: 9
+      toc-depth: 3
+      other-links:
+        - text: ClusTCR
+          href: https://doi.org/10.1093/bioinformatics/btab446
+      grid:
+        body-width: 1000px
+        margin-width: 200px
+author: Vanessa Mhanna
+---
+
+```{=html}
+<style type="text/css">
+
+
+h1 {
+  color: #033c73;
+   font-size: 30px;
+}
+h1.title {
+  color: #033c73;
+}
+h2 {
+  color: #033c73;
+  font-size: 26px;
+}
+h3 {
+   color: #033c73;
+   font-size: 24px;
+}
+h4 {
+   color: #022f5a;
+   font-size: 18px;
+}
+h5 {
+  color: #033c73;
+}
+h6 {
+   color: #033c73;
+}
+body{ 
+  font-size: 16px;
+}
+p.caption {
+  font-size: 0.9em;
+  font-style: italic;
+  color: grey;
+  margin-right: 10%;
+  margin-left: 10%;
+  text-align: justify;
+}
+em { 
+font-weight: normal; font-style: italic; font-size: 0.9em;
+}
+em.special { 
+color: grey; 
+}
+#badge {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+}
+</style>
+```
+**Question: Are there any TCR motifs enriched in the lung cancer TME compared to peripheral blood?**
+
+# Selection of the dataset
+
+```{r loading libraries, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tools)
+library(devtools)
+library(reactable)
+library(stringr)
+library(ggsci)
+library(ComplexHeatmap)
+library(ggplot2)
+library(tibble)
+library(data.table)
+library(reticulate)
+library(stats)
+library(parallel)
+library(pbapply)
+library(igraph)
+library(vegan)
+library(visNetwork)
+library(ggseqlogo)
+library(purrr)
+library(ggh4x)
+
+use_condaenv("tcr")
+
+
+source("/Users/vanessamhanna/Tools/clusTCR/functions.R")
+```
+
+To answer this question, I will first select the appropriate samples from the utility dataset.
+
+My samples of interest are tumor and blood samples from patients with lung cancer.
+
+```{r samples, message=FALSE, fig.cap="Table 1"}
+metadata=read_xlsx("/Users/vanessamhanna/Library/CloudStorage/OneDrive-Personal/Documents/Work_UMRS959/utility/summaryInfo/sample.directory.xlsx")
+
+#only select tumor and blood samples from patients with lung cancer
+metadata_lung<- metadata %>%
+                filter(Tissue == "Lung" & grepl(paste(c("Tumor", "Blood"), collapse="|"), Type))
+
+tbl <- metadata_lung %>% reshape2::dcast(., Sample~Type) 
+tbl[,-1][tbl[,-1] >1]<- 1
+
+reactable(tbl,  bordered = TRUE, compact = TRUE, fullWidth = FALSE,
+          defaultColDef = colDef(vAlign = "center",  align = "center", 
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+Single-cell TCR-seq data was available for blood and tumor samples for only 5 patients. As T cells circulate in and out of the blood, blood samples can provide insight into the physio-pathological context of an individual. Thus, I decided to focus the analysis specifically on these 5 patients with matched blood and tumor samples. I will not incorporate blood samples from patients with other cancer types or those lacking corresponding tumor data. 
+This approach allows me to:
+
+* have comparable number of samples in both groups 
+* directly compare blood and tumor T cell repertoires within the same individuals, potentially revealing important insights about T cell dynamics in the tumor microenvironment and systemic circulation.
+
+```{r selection, message=FALSE, warning=FALSE}
+
+selection <- metadata_lung %>%
+                  reshape2::dcast(., Sample~Type) %>%
+                  mutate_all(~ ifelse(is.numeric(.) & . > 0, 1 ,.)) %>%
+                  filter(rowSums(select_if(., is.numeric))==2) 
+
+metadata_lung <- metadata_lung %>% filter(Sample %in% selection$Sample)
+
+```
+
+From the selected patients, Patient64 is known to have received immunotherapy, specifically immune checkpoint blockades, and was responsive to the treatment. This is to keep in mind as the treatment can alter the T-cell repertoire, compared to the repertoires of naive patients.
+
+```{r treatment, fig.cap="Table 2"}
+tbl<- metadata_lung %>% select( Sample,Treatments,Response) %>% distinct()
+
+reactable(tbl,  bordered = TRUE, 
+          defaultColDef = colDef(vAlign = "center",  align = "center", 
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+Moreover, in this patient, multiple blood and tumor biospecimens were collected at different timepoints as shown in the table below. All samples were collected after the start of the treatment.
+
+```{r aliquots, message=FALSE, fig.cap="Table 3"}
+aliquots=read_xlsx("/Users/vanessamhanna/Downloads/41586_2021_3752_MOESM8_ESM.xlsx", sheet = 2, col_names = F)
+aliquots<- aliquots[-c(1:3),-c(3:6)]
+colnames(aliquots)<- aliquots[1,]
+aliquots <-  aliquots %>% 
+              filter(!row_number() ==1) %>% 
+              replace(is.na(.), "") %>%
+              filter(`Patient study ID` == "MD01-005" & `Assays performed` == "Single cell TCRseq/RNAseq") %>%
+              as.data.frame()
+
+old<- colnames(aliquots)[-c(1:2)]
+
+new<- colnames(aliquots)[-c(1:2)] %>% str_split(., "[.]") %>% sapply(., "[", 2)
+
+my_l <- list()
+for(i in 1:length(new)){
+  my_l[[i]] = colDef(name= new[[i]])
+}
+names(my_l)<- old
+
+reactable(
+ aliquots,
+ style = list( fontSize = "0.875rem"),
+ defaultColDef = colDef(align = "center", vAlign = "center", headerStyle = list(background = "#f7f7f8")),
+ columns = list(my_l,
+                `Patient study ID` = colDef( style = list(backgroundColor = "#f7f7f7"),
+                                              headerStyle =list(backgroundColor = "#f7f7f7"))),
+ columnGroups = list(
+    colGroup(name = "Tissue", 
+             columns = c( "Tissue.Resected tumor (fresh/viable)" , "Tissue.Resected normal lung (fresh/viable)" , "Tissue.Resected tumor-draining lymph node (fresh/viable)"  ,"Tissue.Resected post-op metastatic recurrence (fresh/viable)")),
+    colGroup(name ="Peripheral blood timepoints\n(weeks relative to ICB start)", columns = c("PB.W0 (obtained immediately prior to the start of ICB treatment)", "PB.W2", "PB.W4" , "PB.Post-resection follow-up (range: W7 to W21)")),
+     colGroup(name = "", columns = c("Patient study ID"  , "Assays performed" ))),
+ compact = TRUE,
+ bordered=TRUE
+)
+```
+
+Here is the final number of samples retained for this analysis:
+
+```{r tbl1, echo=FALSE, message=FALSE, fig.cap="Table 4"}
+
+tbl<- metadata_lung %>%
+      group_by( Sample, Type) %>%
+      summarize(count=n()) %>%
+      reshape2::dcast(., Sample~Type)
+
+reactable(tbl, bordered = TRUE,  fullWidth =TRUE,
+          defaultColDef = colDef(vAlign = "center",  align = "center",
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+# Data quality control
+
+The author of the utility dataset made available files that were already aligned and pre-processed. Briefly, the pre-processing step consisted of:
+
+* filtering out low-quality cells or empty droplets with low numbers of unique detected genes, and cell doublets or multiplets with high gene counts. Cells with unique feature counts over 2,500 or less than 100 were excluded.
+* filtering out low-quality/dying cells with high percentages of mitochondrial genes. The chosen cut-off was 10%, i.e. cells with more than 10% of mitochondrial genes.
+
+I applied additional steps for the TCR-seq data cleaning, which included:
+
+* the selection of T-cells only with productive TRA and TRB sequences.
+* removing estimated doublet cells. This estimation was already calculated using scDblFinder.
+* re-calculation of the occurrence and frequency of each unique clone (TRA-TRB CDR3 combination, irrespective of the V and J gene) within each repertoire. Frequencies were then subdivided into the following intervals:
+    +   Rare = 0.0001
+    +   Small = 0.001
+    +   Medium = 0.01
+    +   Large = 0.1
+    +   Hyperexpanded = 1
+* annotate CD4+ and CD8+ T-cell repertoires. As CD8+ and CD4+ can contribute differently to the cancer progression and/or response to treatment, I chose to annotate the repertoires of the two populations to be able to, when relevant, study their repertoires separately. The identification was made based on the ProjecTILs annotation already available in the pre-processed files. Although two different annotation algorithms were used, ProjecTIL and SingleR, I chose the former as it projects scRNA-seq data onto a reference T cell atlas that was defined across different studies, cohorts and cancer types, wheres the latter is more general to all immune cells. 
+Below are the number of cells identified for patient, each tissue type and cell subset.
+
+```{r tbl2, message=FALSE}
+pat<- paste0(metadata_lung$SampleLabel, ".rds")
+rds_list<- list.files("/Users/vanessamhanna/Library/CloudStorage/OneDrive-Personal/Documents/Work_UMRS959/utility/data/processedData/individualSeurat/rds/", 
+                      full.names = TRUE, 
+                      pattern=paste(pat, collapse="|"))
+
+final_tcr<-lapply(rds_list, process_rds)
+final_tcr_all<- do.call(rbind, final_tcr)
+#add sample column from metadata
+final_tcr_all<- merge(final_tcr_all, metadata_lung[,c(1,7,9,10)], by.x="orig.ident", by.y="SampleLabel")
+
+```
+
+```{r cells, echo=FALSE, message=FALSE, fig.cap="Table 5"}
+tbl2<- final_tcr_all %>%
+      group_by( Sample,Tissue, cell_subset) %>%
+      summarize(count=n())
+
+reactable(tbl2, bordered = TRUE,  fullWidth = TRUE, pagination = TRUE, compact = TRUE,
+          defaultColDef = colDef(vAlign = "center",  align = "center", 
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+# TCR-seq analysis
+
+Herein, I conducted all the analysis at the CDR3 level, not taking into account the V and J gene usages. This choice was made particularly for the motif identification step.
+
+Moreover, I set a color-blind friendly palette to ensure that all colors remain consistent across the figures.
+
+```{r colors}
+#attribute colors for tissue and cell subset
+colors <- pal_d3()(6)
+names(colors)<- c(unique(final_tcr_all$Tissue), unique(final_tcr_all$cell_subset), c("A", "B"))
+
+#attribute colors for patients
+col_pals = RColorBrewer::brewer.pal.info[RColorBrewer::brewer.pal.info$category  == "qual" &  
+                                           RColorBrewer::brewer.pal.info$colorblind == "TRUE",]
+mycolors = as.vector(unlist(mapply(RColorBrewer::brewer.pal, col_pals$maxcolors, rownames(col_pals))))
+names=unique(final_tcr_all$Sample)
+l<- length(unique(names))
+mycolors_b<- mycolors[seq_len(l)]
+names(mycolors_b) <-names
+
+intervals<-viridis::viridis(6, alpha = 1, begin = 0, end = 1, direction = 1, option = "B")
+names(intervals) <- c("None = 0", "Rare = 0.0001", "Small = 0.001", "Medium = 0.01", "Large = 0.1", "Hyperexpanded = 1")
+  
+mypal<- list("cell_subset"= colors[3:4], "Tissue"=colors[1:2], "Sample"=mycolors_b, "Chain"=colors[5:6],"Intervals"=intervals)  
+```
+
+## Basic clonal analysis
+
+### Clonal richness
+
+Clonal richness was evaluated based on the number of unique clones in each sample. 
+Numbers were comparable between samples and patients.
+
+```{r unique,message=FALSE,fig.cap="Figure 1: Boxplots showing the number of unique paired CDR3a-CDR3b clones identified in each sample. Samples are represented by the points, and the boxplots show the distribution across all samples in each patient. Patients 35 to 52 have one sequenced sample for each condition."}
+final_tcr_all %>%
+  group_by(orig.ident, cell_subset ,Tissue,Sample) %>%
+  summarize(count=n()) %>%
+  mutate(Tissue= factor(Tissue, levels=c("TME", "Blood"))) %>%
+
+ggplot(., aes(x=Sample, y=count))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(shape=21, aes(fill=Sample))+
+  facet_grid(cell_subset~Tissue)+
+  scale_fill_manual(values=mypal$Sample)+
+  theme_bw()+
+  theme(legend.position = "none")+
+  xlab("")+
+  ylab("Number of unique clones ")
+```
+
+### Clonal distribution
+
+As mentioned in the **Data quality control** section, clone frequencies were divided into intervals. I used these intervals to examine the clonal distribution in each repertoire. 
+All repertoires were mainly composed on small clones, except for 4 samples with high proportions of medium clones. This metric is however dependent on the total number of cells in the repertoire, which was shown to be different from one sample to another (Table 5).
+
+```{r intervals, warning=FALSE,  message=FALSE, fig.cap="Figure 2: Stacked bars showing the distribution of paired CDR3a-CDR3b clones within each interval in each sample. On the x axis, the bottom row represent the patient id, the middle row shows the different aliquots, when available, and the upper row the sample id, which includes the tissue type, patient id and aliquot number."}
+final_tcr_all %>%
+  group_by(orig.ident, cell_subset ,Tissue,Sample, cloneSize) %>%
+  summarize(cnt=n()) %>%
+  mutate(percent=cnt/sum(cnt)) %>%
+  mutate(Sample= gsub("atient", "", Sample),
+         Tissue= factor(Tissue, levels=c("TME", "Blood"))) %>%
+
+
+  ggplot(., ggplot2::aes(x = interaction(orig.ident, Sample), y =percent, fill=factor(cloneSize))) +
+    geom_col(alpha=.85, color="black", size=.3) +
+    facet_grid(cell_subset~Tissue, scales="free")+
+    theme_bw()+
+    theme(legend.title = element_blank(), legend.position = "top", axis.text.x = element_text(size=7))+
+    xlab("")+ ylab("proportion")+
+    guides(x = "axis_nested")+
+    scale_fill_manual(values=mypal$Intervals)
+
+```
+
+## Repertoire similarity analysis
+
+Adaptive immune repertoire (AIR) sharing allows to evaluate the degree of convergence between repertoires. I made use of two dissimilarity indices, each taking into account different parameters.
+
+* The **Jaccard** index: a measure of similarity between sample sets defined as the size of the intersection divided by the size of the union of the sample sets.
+* The **Morisita-Horn** index: a measure of similarity that tends to be over-sensitive to abundant species. This index takes into account the occurrence of clones within each repertoire.
+
+The ward D2 method was used to perform a hierarchical clustering on the calculated distances.
+
+```{r jaccard CD4,  fig.cap="Figure 3: A heatmap showing the Jaccard distances calculated at the paired CDR3a-CDR3b level between all CD4+ samples. The ward D2 method was used to perform the hierarchical clustering."}
+ht1 <- plotDissimilarity(final_tcr_all, 
+                   cell_subset="CD4+",  method = "jaccard", 
+                   clustering="ward.D2",
+                   colorBy=c("cell_subset" ,"Tissue","Sample" ),
+                   label_colors=mypal)
+
+ht1
+
+```
+
+```{r jaccard CD8, fig.cap="Figure 4: A heatmap showing the Jaccard distances calculated at the paired CDR3a-CDR3b level between all CD8+ samples. The ward D2 method was used to perform the hierarchical clustering."}
+ht2 <- plotDissimilarity(final_tcr_all, 
+                   cell_subset="CD8+",  method = "jaccard", 
+                   clustering="ward.D2",
+                   colorBy=c("cell_subset" ,"Tissue","Sample" ),
+                   label_colors=mypal)
+ht2
+```
+
+```{r morisita CD4, fig.cap="Figure 5: A heatmap showing the Morisita distances calculated at the paired CDR3a-CDR3b level between all CD4+ samples. The ward D2 method was used to perform the hierarchical clustering."}
+ht1 <- plotDissimilarity(final_tcr_all, 
+                   cell_subset="CD4+",  method = "morisita", 
+                   clustering="ward.D2",
+                   colorBy=c("cell_subset" ,"Tissue","Sample" ),
+                   label_colors=mypal)
+
+ht1
+```
+
+```{r morisita CD8,  fig.cap="Figure 6: A heatmap showing the Morisita distances calculated at the paired CDR3a-CDR3b level between all CD8+ samples. The ward D2 method was used to perform the hierarchical clustering."}
+ht2 <- plotDissimilarity(final_tcr_all, 
+                   cell_subset="CD8+",  method = "morisita", 
+                   clustering="ward.D2",
+                   colorBy=c("cell_subset" ,"Tissue","Sample" ),
+                   label_colors=mypal)
+ht2
+```
+
+Heatmaps showed a clear separation between the TME and blood repertoires from Patient64, with lower inter-group similarities compared to inter-sample similarities within each tissue type. Moreover, high inter-sample similarities within each group are observed, particularly when using the Morisita index. This indicates that while the sharing between repertoires is around 50%, a score calculated by the Jaccard index, shared TRA-TRB clonotypes are similarly expressed in the compared repertoires, hence the high Morisita scores.
+Interestingly, the other patients clustered per patient's id and not tissue. This could suggest that the observed separation between TME and peripheral blood samples in Patient 64 could potentially be the effect of the treatment on the immune repertoire.
+
+In view of these results, I decided to merge CD4+ and CD8+ in each sample, further increasing the number of sequences in each of the TME and Blood groups in the future analyses.
+
+## Motif identification
+
+### Worfklow
+
+#### Algorithm selection
+
+AIRRs are biomarkers of health and disease, but their complex architecture hinders the identification of features that are associated with the resulting immune response or pathological context, in this case lung cancer. For this purpose, AIR similarity measures applied on full sequences can be generalized to identifying short amino acid motifs. Clustering of similar AIRs, for instance, by short stretches of amino acids, also known as k-mers, and/or physico-chemical properties, can help identify motifs that are implicated in a particular disease.
+
+To perform this analysis, I used ClusTCR, an unsupervised clustering method that can efficiently classify large sets of CDR3 sequences into similarity group, potentially recognizing same antigen epitopes .
+
+![Workflow of ClusTCR](clustcr_workflow.jpg)
+
+Sequences are first roughly categorized into superclusters through efficient K-means clustering (a). Next, Within each supercluster, sequence hashing is applied to sort sequences (b). Sequence pairs with a maximum edit distance of 1, here, the Hamming distance, are selected from each hash. The HD is used as the default metric to express similarity between TCRs. These sequence pairs are used to construct a graph, allowing only equal length of sequences within a single cluster. Similar sequences will share edges within the graph. Finally, the Markov clustering algorithm (MCL) is then used for the identification of substructures, representing groups of CDR3 sequences with similar sequential characteristics (c). These network substructures represent the clusters in ClusTCR's output.
+
+ClusTCR supports the clustering of paired chains. However, after performing several tests, I discovered that the algorithm was doing the following:
+
+* joining both TRA and TRB sequences to form one long sequence, which is biological irrelevant
+* identifying one motif along the whole sequence. This motif can be in the TRA or TRB part of the sequence.
+
+Both chains contribute to the peptide-MHC binding and recognition, however many crystallography studies have reported their different contribution in this process. I thus believe that the two chains should be handled separately when using such clustering algorithms aimed at identifying hotspots and motifs.
+
+In my analysis, I tweaked some parameters in the above-described workflow:
+
+1. The authors of ClusTCR recommend using MCL for data sets containing \< 50,000 CDR3 sequences, and two-step for all data sets with \> 50,000 sequences (to include the Faiss clustering).
+
+```{r prepare data, warning=FALSE, message=FALSE}
+#prepare data for clustcr
+data<- final_tcr_all %>%
+         mutate("TRA"= CTaa %>% str_split( ., "_") %>% sapply(., "[", 1)) %>%
+         mutate("TRB"= CTaa %>% str_split( ., "_") %>% sapply(., "[", 2)) 
+
+data_a <- data %>%  
+          reshape2::dcast(., TRA~Tissue ) %>%  
+          mutate_all(~ ifelse(is.numeric(.) & . > 0, 1 ,.)) %>%
+          filter(rowSums(select_if(., is.numeric))!=2) %>%
+          mutate(chain="A")
+
+data_b <- data %>%
+          reshape2::dcast(., TRB~Tissue ) %>%  
+          mutate_all(~ ifelse(is.numeric(.) & . > 0, 1 ,.)) %>%
+          filter(rowSums(select_if(., is.numeric))!=2) %>%
+          mutate(chain="B")
+
+data_all<- list(data_a, data_b)
+names(data_all)<- c("A","B")
+```
+
+```{r nb cdr3s, message=FALSE, echo=FALSE,fig.cap="Table 6"}
+tbl <- rbind(data_b %>% 
+        rename(cdr3=TRB), data_a %>%  rename(cdr3=TRA)) %>%
+        reshape2::melt() %>%
+        filter(value!=0) %>%
+        group_by( variable,chain) %>%
+        summarize(count=n()) %>%
+        reshape2::dcast(.,chain~variable) %>%
+        mutate(Total=Blood+TME)
+
+reactable(tbl, bordered = TRUE,  fullWidth = TRUE, 
+          defaultColDef = colDef(vAlign = "center",  align = "center", 
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+As both our TRA and TRB datasets have around 50k sequences, I chose to apply the MCL exclusively.
+
+2. HD=1 is usually employed when looking for highly similar sequences that potentially recognize the same antigenic epitopes. As this is not the goal of this analysis, I increased the HD threshold to two to be less stringent and generate larger clusters.
+
+#### Experimental design
+
+```{python clustering, message=FALSE, warning=FALSE}
+from clustcr import read_cdr3, metarepertoire, Clustering, ClusterAnalysis, datasets
+import os
+import random
+import pandas as pd
+
+dataframes = [r.data_a, r.data_b]
+
+res_dfs = dict()
+
+for df in dataframes:
+  cluster_dfs = dict()
+ 
+  chain= ', '.join(map(str, df['chain'].unique().tolist()))
+  print(f"clustering chain: {chain}")
+  clustering = Clustering(method="mcl",
+                          chain= chain,
+                          n_cpus=3)
+  
+  cluster = clustering.fit(df.iloc[:,0])
+  print(f"clustering completed")
+  
+  features=cluster.compute_features(compute_pgen=False)
+  
+  cluster_dfs['df'] = cluster.clusters_df
+  cluster_dfs['edges'] = list(cluster.edges)
+  cluster_dfs['motifs'] = cluster.summary()
+  cluster_dfs['motifs'].insert(2, "chain", chain, True) 
+
+  res_dfs[chain]=cluster_dfs
+
+```
+
+```{r concat_res, message=FALSE, warning=FALSE}
+#concatenate results
+res_dfs <- lapply( py$res_dfs, concat_res)
+```
+
+Following the application of the MCL algorithm, the resulting output corresponds to the list of all clustered sequences (not all sequences in the data are retained), the corresponding motif and a set of calculated physico-chemical properties.
+
+```{r tbly, echo=FALSE,fig.cap="Table 7"}
+tbl <- res_dfs[["A"]][,c(9,1,2,7,8,3:6)]
+tbl[,6:9]<-apply(tbl[,6:9], 2, round, 2)
+reactable(head(tbl),
+          bordered = TRUE,
+          columns = list(
+    chain = colDef(maxWidth = 65),
+    cluster = colDef(maxWidth = 70),
+    size= colDef(maxWidth = 50),
+    junction_aa = colDef(minWidth = 170),
+    motif = colDef(minWidth = 160)
+  ),
+          defaultColDef = colDef(vAlign = "center",  align = "center", 
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+In order to identify clusters TME-enriched clusters, I compared, for each cluster, the number of sequences belonging to each of the TME or blood group and applied a Fisher's exact test. I then used the following thresholds to select TME-enriched clusters: 
+
+* a significant p value (\<=0.01) 
+* an odds ratio exceeding the mean of the odds ratio distribution across all clusters.
+Clusters that met both criteria were selected.
+
+```{r enrichment, message=FALSE}
+loaded_libs <- names(sessionInfo()$otherPkgs)
+
+enrichment_tme<-lapply(res_dfs, prepa_enrich, loaded_libs)
+```
+
+```{r filter, message=FALSE}
+tcr_results<- list()
+for(i in names(enrichment_tme)){
+  #filter out non significant on p values
+  signif_cl <- enrichment_tme[[i]] %>% filter(p<=0.01)
+  
+  # add another filter to reduce the number of clusters using the odds ratio. the threshold is chosen as the mean of the odds ratio distribution
+  signif_cl$odds[which(!is.finite(signif_cl$odds))] <- max(signif_cl$odds[is.finite(signif_cl$odds)]) + 1
+  th=mean(signif_cl$odds)
+  
+  signif_cl <- signif_cl %>% filter(odds>=th)
+
+  tcr_results[[i]]<- enrichment_tme[[i]] %>% filter(cluster %in% signif_cl$cluster)
+}
+
+```
+
+### Cluster evaluation
+
+The number of enriched clusters was lower in the TRA repertoires compared to TRB, however cluster size was higher in the former compared to the latter. This can be due to the absence of the TRD gene in the TRA sequence, which adds a level of diversity in the TRB sequence, thus allowing a higher degree of similarity between TRA sequences.
+
+```{r tblx, fig.cap="Table 8"}
+tcr_results[["A"]]<- tcr_results[["A"]] %>% mutate(chain="A")
+tcr_results[["B"]]<- tcr_results[["B"]] %>% mutate(chain="B")
+
+tbl<- do.call( rbind, tcr_results)
+reactable(tbl %>% group_by(chain) %>% summarize(`Nb of clusters`=n()),
+          bordered = TRUE, fullWidth = FALSE,
+          defaultColDef = colDef(vAlign = "center",  align = "center", 
+                                 headerStyle = list(background = "#f7f7f8")))
+```
+
+```{r, fig.cap="Figure 7: Density distribution of TME-enriched cluster size in the TRA and TRB repertoires."}
+distrib<- list()
+for(i in unique(names(tcr_results))){
+  distrib[[i]] <- tcr_results[[i]]  %>%
+               mutate(sum=Blood+TME) 
+}
+distrib<- do.call(rbind, distrib)
+distrib %>%
+  ggplot(., aes(x=sum , color=chain, fill=chain)) +
+  geom_density(alpha=.5)+
+  theme_bw()+
+  scale_color_manual(values=mypal$Chain)+
+  scale_fill_manual(values=mypal$Chain)+
+  xlab("Cluster size")
+
+```
+
+### Motif visualization and network construction
+
+Results can be visualized as networks. In the these networks, nodes represent the TRA or TRB CDR3 sequences, and edges link sequences that differ by HD=2. Nodes are colored based on their source, TME or Blood.
+
+In a consistent way, network visualization of the TRA repertoire shows an enrichment in TME sequences.
+
+```{r generate graph}
+graphs<- lapply(py$res_dfs, gen_graph)
+```
+
+```{r graph a, fig.cap="Figure 8: Interactive network in which a node represent a TRA CDR3 sequence, and edges link sequences that differ by HD=2. Nodes are colored based on their source, TME in orange and blood in blue."}
+viz <- toVisNetworkData(graphs[["A"]])
+cols<- as.data.frame(colors[1:2])
+cols <- cols %>% rownames_to_column("label") %>% rename(color=`colors[1:2]`)
+visNetwork(nodes = viz$nodes %>% mutate(label=""), edges = viz$edges %>% mutate(title=motif)) %>%
+  visNetwork::visEdges(color = list(color = "darkgrey" )) %>%
+  visNetwork::visLegend(enabled = T, addNodes=cols , position = "right" ) %>%
+  visNetwork::visIgraphLayout(layout = "layout_with_mds")
+```
+
+I then selected the top 5 clusters with the highest number of sequences, and applied a sequence logo to better visualize the corresponding motifs. 3 out of the 5 clusters share the same motif, making it the most represented within the clusters. This is not surprising, as one same sequence can be found in a multiple of clusters with different sequence neighbors. This is intrinsic to the MCL algorithm which tries to identify dense subclusters of sequences.
+
+```{r logo a, fig.cap="Figure 9: TRA sequence logo were drawn for each of the top 5 clusters with the highest number of sequences."}
+#select top 5
+sub <- tcr_results[["A"]] %>% 
+                    merge(., res_dfs[["A"]] %>% select(cluster, size) %>% distinct() , by="cluster") %>%
+                    top_n(5, wt = size) 
+
+tcr_results_sub <-res_dfs[["A"]] %>% filter(cluster %in% sub$cluster)
+
+
+logo_list<- tcr_results_sub %>%
+            group_split(cluster) %>% 
+            map(~ .x %>% pull(junction_aa))
+
+ggseqlogo(logo_list, ncol=1)
+
+```
+
+Similarly to the results on the alpha chain, TRB motifs within the top 5 clusters were conserved with three unique motifs.
+
+```{r graph b, fig.cap="Figure 10: Interactive network in which a node represent a TRB CDR3 sequence, and edges link sequences that differ by HD=2. Nodes are colored based on their source, TME in orange and blood in blue."}
+viz <- toVisNetworkData(graphs[["B"]])
+cols<- as.data.frame(colors[1:2])
+cols <- cols %>% rownames_to_column("label") %>% rename(color=`colors[1:2]`)
+visNetwork(nodes = viz$nodes %>% mutate(label=""), edges = viz$edges %>% mutate(title=motif)) %>%
+  visNetwork::visEdges(color = list(color = "darkgrey" )) %>%
+  visNetwork::visLegend(enabled = T, addNodes=cols , position = "right" ) %>%
+  visNetwork::visIgraphLayout(layout = "layout_with_mds")
+```
+
+```{r logo b, fig.cap="Figure 11: TRB sequence logo were drawn for each of the top 5 clusters with the highest number of sequences."}
+#select top 5
+sub <- tcr_results[["B"]] %>% 
+                    merge(., res_dfs[["B"]] %>% select(cluster, size) %>% distinct() , by="cluster") %>%
+                    top_n(5, wt = size) 
+
+tcr_results_sub <-res_dfs[["B"]] %>% filter(cluster %in% sub$cluster)
+
+
+logo_list<- tcr_results_sub %>%
+            group_split(cluster) %>% 
+            map(~ .x %>% pull(junction_aa))
+ggseqlogo(logo_list, ncol=1)
+
+```
+
+### Physico-chemical features
+
+ClusTCR calculates several amino acid sequence properties, including a number of physicochemical properties. The calculated properties are the following: 
+
+* Mutation stability: refers to how changes in the CDR3 amino acid sequence affect its overall stability and function
+* The overall basicity of a sequence: depends on the proportion and distribution of basic amino acids within it. 
+* The overall hydrophobicity of a sequence: depends on the proportion and distribution of hydrophobic amino acids within it 
+* Helicity: it can affect protein stability, folding, and function. Factors like polarity, hydrophobicity affect helicity. Mutations that alter these properties can impact the helical structure.
+
+```{r features all, message=FALSE}
+plots<- list()
+for(i in names(res_dfs)){
+  
+x=py$res_dfs[[i]][["df"]]
+
+feat_sub <- x %>%
+            merge(.,  tcr_results[[i]] , by="cluster") %>%
+            select(-c(p ,odds,Blood, TME, cluster, chain)) %>%
+            distinct() %>%
+            mutate(group="enriched") 
+other <- x %>% 
+        filter(!cluster %in% feat_sub$cluster) %>%
+        select(-c( cluster)) %>%
+        distinct() %>%
+        filter(!junction_aa %in% feat_sub$junction_aa ) %>%
+        mutate(group="not enriched")
+
+df_all<- rbind(feat_sub, other)
+
+x_sub <- x %>% select(- cluster) %>%  distinct() 
+
+
+mds <- bigmds::fast_mds(x = as.matrix(x_sub[,-1]), l = 200, s_points = 5 * 2, r = 2, n_cores = 3)
+fit<- as.data.frame(mds$points)
+colnames(fit)<- c("MDS1", "MDS2")
+fit$junction_aa<- x_sub[,1]
+fit<- fit %>% merge(., df_all[,c(1,6)]) 
+
+plots[[i]][["mds"]]<-ggpubr::ggscatter(fit , x = "MDS1", y = "MDS2",
+                     color = "black",
+                     fill = "group",
+                     shape = 21,
+                     alpha=.2,
+                     conf.int = TRUE,
+                     conf.int.level=0.95,
+                     ellipse = TRUE, 
+                     repel = TRUE,
+                     title = i, 
+                     ggtheme = theme_bw())+
+  ggplot2::geom_hline(yintercept = 0, color = "gray", size = 0.1, linetype = "dashed")+
+  ggplot2::geom_vline(xintercept = 0, color = "gray", size = 0.1, linetype = "dashed")
+
+plots[[i]][["boxplot"]] <- x_sub %>%
+                          reshape2::melt() %>%
+                          merge(., df_all[,c(1,6)]) %>%
+                          mutate(chain=i) %>%
+                          ggplot(., aes(x=group, y=value))+
+  geom_violin()+
+                          geom_boxplot(fill=NA, outlier.shape=21, width=.3)+
+                          facet_wrap(chain~variable, scales="free", nrow=1)+
+                          theme_bw()+
+                          xlab("")+
+                          ggpubr::stat_compare_means(
+                         aes(label = paste0("p = ", after_stat(p.format))), size=4)
+}
+
+
+```
+
+I first performed an MDS on the physico-chemical features. An euclidean distance was used to obtain an distance matrix on which the MDS was performed. 
+Results showed no separation observed between TME-enriched and TME-non enriched sequences.
+
+```{r, fig.cap="Figure 12: Euclidean distances were calculated on the four features between all pairwise samples within the dataset and used to perform a multidimensional scaling analysis"}
+gridExtra::grid.arrange(plots[[1]][[1]], plots[[2]][[1]], nrow = 2)
+```
+
+I thus explored each property separately. 
+Enriched TRA and TRB sequences showed significantly lower basicity compared to non-enriched sequences. In addition, the mutation stability, was higher in enriched TRB sequences exclusively. The other properties did not show any significant differences.
+
+```{r, fig.cap="Figure 13: Boxplots showing the four physico-chemical properties of sequences in TME-enriched and non-enriched clusters. A wilcoxon-test was applied."}
+gridExtra::grid.arrange(plots[[1]][[2]], plots[[2]][[2]], nrow = 2)
+```
+
+### Enrichment of cell subsets
+
+As CD8+ and CD4+ T cell repertoires were grouped to perform the clustering and motif identification step, I evaluated whether the identified TME-enriched clusters were preferentially composed of sequences from one subset compared to the other. 
+A significant predominance of CD4+ sequences was found for both chains.
+
+```{r, message=FALSE, fig.cap="Figure 14: Boxplots showing the percentage of enriched sequences beloging to the CD4+ or CD8+ cell subset in each patient."}
+
+prop_pop <- list()
+
+for(i in names(res_dfs)){
+
+prop_pop[[i]] <- tcr_results[[i]] %>% 
+                merge(., res_dfs[[i]][,1:2] , by="cluster") %>%
+                merge(., data, by.x="junction_aa", by.y=paste0("TR",i))  %>%
+                filter(Tissue=="TME") %>%
+                select(junction_aa, cell_subset, Tissue, Sample, orig.ident) %>%
+                distinct()%>%
+                group_by(cell_subset, Sample, orig.ident ) %>%
+                summarize(count=n()) %>%
+                mutate( chain=i)
+                
+}
+
+prop_pop<- do.call(rbind, prop_pop)
+
+
+ggplot(prop_pop, aes(x=cell_subset, y=count))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(fill=Sample),shape=21, width=.2)+
+  facet_wrap(chain~., scales="free")+
+  scale_fill_manual(values=mypal$Sample)+
+  theme_bw()+
+  xlab("")+
+  ylab("Number of sequences")+
+ ggpubr::stat_compare_means(
+ aes(label = paste0("p = ", after_stat(p.format)))
+)
+
+```
+
+### Enrichment of patients
+In addition, I looked how sequences within TME-enriched clusters were distributed in the different patients samples.
+Sequences derived from Patient64 showed a higher prevalence within the TME-enriched clusters. This is expected given the larger initial number of sequences obtained from this patient's samples compared to those from the other patients.
+
+```{r, message=FALSE, warning=FALSE, fig.cap="Figure 15: Boxplots showing the percentage of enriched sequences beloging to each patient.."}
+prop_patient <- list()
+
+for(i in names(res_dfs)){
+ 
+prop_patient[[i]] <- tcr_results[[i]] %>% 
+                merge(., res_dfs[[i]][,1:2] , by="cluster") %>%
+                merge(., data, by.x="junction_aa", by.y=paste0("TR",i))  %>%
+                filter(Tissue=="TME") %>%
+                select(junction_aa, Tissue, Sample, orig.ident) %>%
+                distinct()%>%
+                group_by( Sample, orig.ident, Tissue) %>%
+                summarize(count=n()) %>%
+                group_by(  Tissue) %>%
+                mutate(percent=count/sum(count), chain=i)
+                
+}
+
+prop_patient<- do.call(rbind, prop_patient)
+
+ggplot(prop_patient, aes(x=Sample, y=percent*100))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(fill=Sample),shape=21, width=.2)+
+  facet_wrap(chain~., scales="free")+
+  scale_fill_manual(values=mypal$Sample)+
+  theme_bw()+
+  theme(axis.text.x = element_blank())+
+  xlab("")+
+  ylab("percentage")
+```
+
+### Clonal expansion
+
+Lastly, I evaluated whether sequences within the TME-enriched clusters were highly expressed in the patients initial TME repertoires. 
+Indeed, these sequences have higher frequencies relative to ones from non-enriched clusters, although the numbers of sequences between the two groups is highly unbalanced.
+
+```{r, message=FALSE, fig.cap="Figure 16: Boxplots showing the occurrence (in percentage) of enriched sequences in the initial repertoires of each patient."}
+
+expanded <- list()
+
+for(i in names(res_dfs)){
+  others<- res_dfs[[i]] %>% 
+            filter(!cluster %in% tcr_results[[i]]$cluster) %>%
+            merge(., data, by.x="junction_aa", by.y=paste0("TR",i))  %>%
+                      filter(Tissue=="TME") %>%
+                      select(chain, junction_aa, Tissue, Sample, orig.ident, Tissue, count) %>%
+                      distinct()%>%
+                      group_by(chain,junction_aa, orig.ident,Tissue, Sample) %>%
+                      summarize(count=sum(count)) %>%
+                      group_by( Sample, orig.ident, Tissue) %>%
+                      mutate(percent=count/sum(count),
+                            group="not enriched") 
+                      
+  
+  
+oi <- tcr_results[[i]] %>% 
+                      merge(., res_dfs[[i]][,1:2] , by="cluster") %>%
+                      merge(., data, by.x="junction_aa", by.y=paste0("TR",i))  %>%
+                      filter(Tissue=="TME") %>%
+                      select(chain, junction_aa, Tissue, Sample, orig.ident, Tissue, count) %>%
+                      distinct()%>%
+                      group_by(chain,junction_aa, orig.ident,Tissue, Sample) %>%
+                      summarize(count=sum(count)) %>%
+                      group_by( Sample, orig.ident, Tissue) %>%
+                      mutate(percent=count/sum(count),
+                               group="enriched") 
+
+expanded[[i]] = rbind(others, oi)
+
+}
+
+expanded<- do.call(rbind, expanded)
+
+expanded %>%
+  ggplot(., aes(x=group, y=percent))+
+  geom_boxplot(fill=NA, outlier.shape=21)+
+  facet_grid(.~chain)+
+  theme_bw()+
+  xlab("")+
+  ggpubr::stat_compare_means(
+ aes(label = paste0("p = ", after_stat(p.format))))
+```
+
+### Chain pairing
+
+In my final attempt to retrieve paired-chain information, 
+
+* I generated all possible TRA-TRB combinations from sequences within the TME-enriched clusters (375 TRA and 468 TRB) 
+* Searched for these sequences in the initial paired dataset 
+A total of 12 paired sequences were identified, all of which were small clones, i.e frequencies lower than 0.001.
+
+```{r}
+
+tra <- tcr_results[[1]] %>% 
+                      merge(., res_dfs[[1]][,1:2] , by="cluster") %>% select(junction_aa, chain) %>% distinct() %>% pull(junction_aa)
+
+trb <- tcr_results[[2]] %>% 
+                      merge(., res_dfs[[2]][,1:2] , by="cluster") %>% select(junction_aa, chain) %>% distinct() %>% pull(junction_aa)
+
+x <- expand.grid(tra, trb, stringsAsFactors = FALSE)
+x<- x %>% mutate(junction_aa = paste0(Var1, "_", Var2)) %>% filter(junction_aa %in% data$CTaa)
+
+x_sub<-  data %>% filter( CTaa %in% x$junction_aa)
+                     
+
+```
+
+# Conclusion
+In this analysis, the TCR repertoire from lung cancer patients was analysed. Samples were collected from the tumor microenvironment and the peripheral blood. The goal was to potentially identify TCR motifs enriched in the lung cancer TME compared to peripheral blood.
+
+Using clusTCR as a clustering algorithm and an enrichment Fisher's test, TME-enriched clusters with specific amino acid motifs were identified. 
+Sequences within these clusters were mainly enriched in CD4+ sequences, potentially revealing the higher contribution of this subset in the disease progression, or response to treatment. The latter is because one patient received an immunotherapy and was responsive to the treatment. Moreover, TME-enriched clusters were also mainly composed of sequences from this patient, which had the highest number of samples in the dataset.
+Finally, sequences from TME-enriched clusters were expanded in the initial repertoires, suggesting their contribution in the ongoing immune response.
+Although TRA and TRB repertoires were analysed separately, comparable results were obtained on both chains.
+
+
+# Challenges
+
+## Small and heterogeneous cohort
+
+The main challenge in this study was the cohort. Patients exhibited diversity in their treatment status, with one patient being treated and responding to the treatment as opposed to the remaining 4 patients. Moreover, this patient had the most number of samples (14 and 8) vs 1 in all other patients. Thus, differences in the T-cell TCR repertoires between the lung TME and the peripheral blood could be concealed due to the effect of treatment is most samples.
+
+## Low number of sequences
+
+One of the critical issues when conducting such an analysis on a single-cell dataset is the low number of sequences in the samples. As seen in the metadata, some samples had only around 1000 cells with productive TCR-seq data. This makes the application of clustering algorithms or machine learning, and the obtaining of accurate interpretable results a challenging task. Tools such immuneSIM and OLGA allow the generation of a large numbers of sequences with specific properties to be used in such studies, in order to augment the data size particularly for AIRR-based ML algorithms.
+
+## Analysis of paired sequences
+
+Currently available clustering algorithms do not propose an efficient way for handling paired chain datasets. Most used tools, such as Gliph2 and tcrdist3, do support paired chain datasets but will only take one chain into account during the calculation (the TRB chain exclusively for Gliph2). Although tcrdist3 proposes a strategy to sum the distance matrices obtained for each chain, identified motifs will only be generated for each chain separately.
